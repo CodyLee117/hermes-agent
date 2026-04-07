@@ -580,14 +580,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
                 #   "all"      — accept all bot messages
+                # DISCORD_ALLOWED_BOT_IDS: comma-separated bot user IDs that are
+                #   always allowed regardless of DISCORD_ALLOW_BOTS setting.
+                #   Use this for trusted coordinator bots (e.g. Ziggy) so they can
+                #   ping agents without enabling bot-to-bot loops.
                 if getattr(message.author, "bot", False):
-                    allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-                    if allow_bots == "none":
-                        return
-                    elif allow_bots == "mentions":
-                        if not self._client.user or self._client.user not in message.mentions:
+                    allowed_bot_ids = {
+                        i.strip()
+                        for i in os.getenv("DISCORD_ALLOWED_BOT_IDS", "").split(",")
+                        if i.strip()
+                    }
+                    if str(message.author.id) in allowed_bot_ids:
+                        pass  # explicitly trusted bot — fall through to handle_message
+                    else:
+                        allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+                        if allow_bots == "none":
                             return
-                    # "all" falls through to handle_message
+                        elif allow_bots == "mentions":
+                            if not self._client.user or self._client.user not in message.mentions:
+                                return
+                        # "all" falls through to handle_message
 
                 # If the message @mentions other users but NOT the bot, the
                 # sender is talking to someone else — stay silent.  Only
@@ -2096,7 +2108,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in).
-            in_bot_thread = is_thread and thread_id in self._bot_participated_threads
+            # Exception: never skip the mention check for bot authors — this
+            # prevents bot-to-bot loops where thread participation causes agents
+            # to respond to each other without explicit @mentions.
+            _author_is_bot = getattr(message.author, "bot", False)
+            in_bot_thread = (
+                is_thread
+                and thread_id in self._bot_participated_threads
+                and not _author_is_bot
+            )
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if self._client.user not in message.mentions:
