@@ -3091,6 +3091,25 @@ class GatewayRunner:
                         )
                 return None
 
+            # Append stats footer if enabled (HERMES_STATS_FOOTER=true)
+            if response and os.getenv("HERMES_STATS_FOOTER", "false").lower() in ("true", "1", "yes"):
+                try:
+                    _model = (agent_result.get("model") or "").split("/")[-1]  # strip provider prefix
+                    _in = agent_result.get("input_tokens", 0)
+                    _out = agent_result.get("output_tokens", 0)
+                    _cache_r = agent_result.get("cache_read_tokens", 0)
+                    _cache_w = agent_result.get("cache_write_tokens", 0)
+                    _ctx = agent_result.get("last_prompt_tokens", 0)
+                    _footer_parts = [f"**{_model}**" if _model else None,
+                                     f"↑{_in:,} ↓{_out:,} tok" if (_in or _out) else None,
+                                     f"ctx {_ctx:,}" if _ctx else None,
+                                     f"cache r{_cache_r:,}/w{_cache_w:,}" if (_cache_r or _cache_w) else None]
+                    _footer = " · ".join(p for p in _footer_parts if p)
+                    if _footer:
+                        response = f"{response}\n-# {_footer}"
+                except Exception:
+                    pass
+
             return response
             
         except Exception as e:
