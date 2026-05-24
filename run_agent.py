@@ -5466,7 +5466,6 @@ class AIAgent:
             "deepseek/",
             "anthropic/",
             "openai/",
-            "x-ai/",
             "google/gemini-2",
             "qwen/qwen3",
         )
@@ -5820,6 +5819,115 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
+    def _pre_compress_vault_flush(self, messages: list) -> None:
+        """Extract and persist session knowledge to Obsidian vault before compaction.
+
+        Reads config from compression.vault_flush:
+          enabled: bool        - feature flag (default false)
+          vault_path: str      - path to Obsidian vault root
+          qmd_cmd: str         - path to qmd binary (optional, for re-indexing)
+          daily_subdir: str    - subdirectory for daily notes (default 'daily')
+        """
+        _cfg = (getattr(self, "_agent_cfg", None) or {}).get("compression", {}).get("vault_flush", {})
+        if not _cfg.get("enabled", False):
+            return
+        vault_path = _cfg.get("vault_path", "").strip()
+        if not vault_path:
+            logger.debug("vault_flush enabled but vault_path not set — skipping")
+            return
+
+        daily_subdir = _cfg.get("daily_subdir", "daily")
+        qmd_cmd = _cfg.get("qmd_cmd", "").strip()
+
+        # Only flush if there's enough conversation to be worth it
+        user_turns = sum(1 for m in messages if m.get("role") == "user")
+        if user_turns < 3:
+            return
+
+        try:
+            from agent.auxiliary_client import call_llm
+            import datetime, subprocess, textwrap
+
+            # Serialize recent messages for the extraction prompt
+            # Only use last 60 messages to keep the prompt manageable
+            _recent = messages[-60:] if len(messages) > 60 else messages
+            _lines = []
+            for m in _recent:
+                role = m.get("role", "?")
+                msg_content = m.get("content", "")
+                if isinstance(msg_content, list):
+                    msg_content = " ".join(
+                        part.get("text", "") for part in msg_content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+                if msg_content and role in ("user", "assistant"):
+                    _lines.append(f"{role.upper()}: {str(msg_content)[:500]}")
+            convo_text = "\n".join(_lines)
+
+            extraction_prompt = textwrap.dedent(f"""
+                You are a knowledge extraction assistant. Review this conversation and extract
+                information worth saving to a persistent knowledge base.
+
+                EXTRACT ONLY genuinely new, important, durable facts such as:
+                - Technical decisions made and their rationale
+                - Bugs found and how they were fixed
+                - Configuration changes and why
+                - New tools/techniques discovered
+                - Important project context established
+                - Lessons learned
+
+                DO NOT extract: casual chat, temporary task state, things already well-known,
+                or anything that would be stale/irrelevant in a future session.
+
+                If there is nothing worth saving, respond with exactly: NOTHING_TO_SAVE
+
+                Otherwise respond with a concise markdown bullet list (no headers, just bullets).
+                Keep each bullet to 1-2 sentences max.
+
+                CONVERSATION:
+                {convo_text}
+            """).strip()
+
+            result = call_llm(
+                messages=[{"role": "user", "content": extraction_prompt}],
+                task="compression",
+                config=getattr(self, "_config", None),
+                max_tokens=800,
+            )
+
+            if not result or result.strip() == "NOTHING_TO_SAVE":
+                logger.debug("vault_flush: nothing worth saving")
+                return
+
+            # Write to daily note
+            today = datetime.date.today().isoformat()
+            daily_dir = os.path.join(os.path.expanduser(vault_path), daily_subdir)
+            os.makedirs(daily_dir, exist_ok=True)
+            note_path = os.path.join(daily_dir, f"{today}.md")
+
+            timestamp = datetime.datetime.now().strftime("%H:%M")
+            entry = f"\n\n## 🗜️ Pre-compaction save ({timestamp})\n\n{result.strip()}\n"
+
+            with open(note_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+
+            logger.info("vault_flush: wrote pre-compaction notes to %s", note_path)
+            if not self.quiet_mode:
+                print(f"  📚 Vault flush: saved session notes to {today}.md")
+
+            # Re-index vault if qmd_cmd provided
+            if qmd_cmd:
+                try:
+                    subprocess.run(
+                        [os.path.expanduser(qmd_cmd), "update"],
+                        timeout=30, capture_output=True,
+                    )
+                except Exception as e:
+                    logger.debug("vault_flush: qmd update failed: %s", e)
+
+        except Exception as e:
+            logger.warning("vault_flush pre-compression step failed (non-fatal): %s", e)
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default") -> tuple:
         """Compress conversation context and split the session in SQLite.
 
@@ -5832,6 +5940,8 @@ class AIAgent:
             self.session_id or "none", _pre_msg_count,
             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
         )
+        # Pre-compression vault flush: persist session knowledge before context is lost
+        self._pre_compress_vault_flush(messages)
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 

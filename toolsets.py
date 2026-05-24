@@ -88,8 +88,8 @@ TOOLSETS = {
     },
     
     "image_gen": {
-        "description": "Creative generation tools (images)",
-        "tools": ["image_generate"],
+        "description": "Creative generation tools (images via DALL-E, ComfyUI/Stable Diffusion)",
+        "tools": ["image_generate", "comfyui_generate", "comfyui_submit_workflow", "comfyui_status", "comfyui_launch", "comfyui_close", "texel_start", "texel_stop", "texel_status", "texel_generate", "texel_get_result", "texel_list_palettes"],
         "includes": []
     },
     

@@ -6094,6 +6094,27 @@ class GatewayRunner:
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+        # Guest mode: if DISCORD_GUEST_USERS is set and the sender is NOT in
+        # DISCORD_ALLOWED_USERS, strip dangerous toolsets so guests can chat
+        # but cannot exec commands, write files, or spawn agents.
+        from gateway.config import Platform as _Platform
+        if source.platform == _Platform.DISCORD and os.getenv("DISCORD_GUEST_USERS", "").strip():
+            _trusted_ids = {
+                uid.strip()
+                for uid in os.getenv("DISCORD_ALLOWED_USERS", "").split(",")
+                if uid.strip()
+            }
+            if _trusted_ids and source.user_id not in _trusted_ids:
+                _guest_blocked = {
+                    "terminal", "code_execution", "delegation",
+                    "cronjob", "rl", "file", "memory", "homeassistant",
+                }
+                enabled_toolsets = [t for t in enabled_toolsets if t not in _guest_blocked]
+                logger.info(
+                    "[gateway] Guest user %s on Discord — restricted toolsets: %s",
+                    source.user_id, enabled_toolsets,
+                )
+
         # Apply tool preview length config (0 = no limit)
         try:
             from agent.display import set_tool_preview_max_len

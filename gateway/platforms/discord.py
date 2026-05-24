@@ -572,9 +572,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
                     return
 
-                # Check if the message author is in the allowed user list
+                # Check if the message author is in the allowed user list.
+                # If DISCORD_GUEST_USERS is set, non-bot users not in the main
+                # allowlist are accepted as guests (with reduced toolsets enforced
+                # later in gateway/run.py).
+                _author_is_bot_early = getattr(message.author, "bot", False)
                 if not self._is_allowed_user(str(message.author.id)):
-                    return
+                    _guest_env = os.getenv("DISCORD_GUEST_USERS", "").strip()
+                    if not _guest_env or _author_is_bot_early:
+                        return  # not trusted and guest access off (or it's a bot)
 
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
