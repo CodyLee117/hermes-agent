@@ -41,7 +41,49 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+from gateway.platforms.discord import DiscordAdapter, _leading_mentions  # noqa: E402
+
+
+def test_leading_mentions_extraction():
+    assert _leading_mentions("<@123> hello") == "<@123>"
+    assert _leading_mentions("<@!123> <@456> hi") == "<@!123> <@456>"
+    assert _leading_mentions("  <@123>  rest") == "<@123>"
+    assert _leading_mentions("no mention here") == ""
+    assert _leading_mentions("text <@123> mid-message") == ""  # only leading counts
+    assert _leading_mentions("") == ""
+
+
+@pytest.mark.asyncio
+async def test_split_message_reinjects_mention_into_every_chunk():
+    """A long message led by a mention must keep that mention on every chunk —
+    otherwise only chunk 0 pings the recipient and their monitor misses the rest."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    sent = []
+
+    async def fake_send(*, content, reference=None):
+        sent.append(content)
+        return SimpleNamespace(id=len(sent))
+
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(),
+        send=AsyncMock(side_effect=fake_send),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    mention = "<@1482601532296921158>"
+    long_body = " ".join(f"word{i}" for i in range(700))  # well over 2000 chars
+    result = await adapter.send("555", f"{mention} {long_body}")
+
+    assert result.success is True
+    assert channel.send.await_count >= 2, "message should have split into multiple chunks"
+    # Every chunk carries the mention, and stays under the Discord limit.
+    for chunk in sent:
+        assert mention in chunk, f"chunk missing mention: {chunk[:60]!r}…"
+        assert len(chunk) <= adapter.MAX_MESSAGE_LENGTH
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -72,6 +73,26 @@ def _clean_discord_id(entry: str) -> str:
     if entry.lower().startswith("user:"):
         entry = entry[5:]
     return entry.strip()
+
+
+# Leading run of Discord mentions at the very start of a message, e.g.
+# "<@123> <@!456> hello" -> "<@123> <@!456>".  Used so that when a long message
+# is split into chunks, every chunk keeps the mention(s) — otherwise only the
+# first chunk pings the target and the recipient's monitor never wakes on the
+# rest (the cross-agent "missed ping on split message" bug).
+_LEADING_MENTIONS_RE = re.compile(r"^\s*((?:<@!?\d+>[ \t]*)+)")
+
+
+def _leading_mentions(text: str) -> str:
+    """Return the normalized leading-mention prefix of *text*, or "".
+
+    Only mentions at the very start are returned (the coordination convention is
+    a leading ``<@id>``); mid-message mentions are left alone.
+    """
+    m = _LEADING_MENTIONS_RE.match(text or "")
+    if not m:
+        return ""
+    return " ".join(re.findall(r"<@!?\d+>", m.group(1)))
 
 
 def check_discord_requirements() -> bool:
@@ -784,9 +805,20 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
 
-            # Format and split message if needed
+            # Format and split message if needed.  Reserve room for the leading
+            # mention prefix so it can be re-injected into every chunk and still
+            # stay under MAX_MESSAGE_LENGTH.
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            mention_prefix = _leading_mentions(formatted)
+            split_limit = self.MAX_MESSAGE_LENGTH
+            if mention_prefix:
+                split_limit -= len(mention_prefix) + 1  # +1 for the rejoining newline
+            chunks = self.truncate_message(formatted, split_limit)
+            # Re-inject the mention(s) into continuation chunks so every part pings
+            # the target — chunk 0 already carries them as the message's start.
+            # Without this, a split message only wakes the recipient on chunk 0.
+            if mention_prefix and len(chunks) > 1:
+                chunks = [chunks[0]] + [f"{mention_prefix}\n{c}" for c in chunks[1:]]
 
             message_ids = []
             reference = None
