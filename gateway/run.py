@@ -233,6 +233,7 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
+from gateway.project_context import get_project_context_block
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
@@ -2334,7 +2335,14 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        
+
+        # Per-channel project-context injection — auto-onboard the agent to the
+        # project this channel maps to (channel-map.json → project-rules/<name>.md).
+        # Fail-open no-op for unmapped channels.  See gateway/project_context.py.
+        _project_block = get_project_context_block(source, session_entry.session_id)
+        if _project_block:
+            context_prompt += "\n\n" + _project_block
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
