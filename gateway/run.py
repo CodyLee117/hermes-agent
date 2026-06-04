@@ -238,6 +238,23 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
 
+def _prepend_reasoning_block(response: str, display_reasoning: str) -> str:
+    """Prepend a 💭 reasoning block to *response*, hoisting leading mentions.
+
+    Platform adapters re-inject the *leading* ``<@id>`` mention prefix into
+    every split chunk (the cross-agent "missed ping on split message" fix);
+    prepending reasoning above a leading mention would hide it mid-message and
+    break that.  So any mention run at the very start of the response is kept
+    in front of the reasoning block.
+    """
+    block = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n"
+    m = re.match(r"^\s*((?:<@!?\d+>[ \t]*)+)", response)
+    if m:
+        mentions = " ".join(re.findall(r"<@!?\d+>", m.group(1)))
+        return f"{mentions}\n{block}{response[m.end():]}"
+    return block + response
+
+
 def _normalize_whatsapp_identifier(value: str) -> str:
     """Strip WhatsApp JID/LID syntax down to its stable numeric identifier."""
     return (
@@ -2971,7 +2988,7 @@ class GatewayRunner:
                         display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
                     else:
                         display_reasoning = last_reasoning.strip()
-                    response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+                    response = _prepend_reasoning_block(response, display_reasoning)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {

@@ -120,3 +120,36 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     assert channel.send.await_count == 2
     assert send_calls[0]["reference"] is ref_msg
     assert send_calls[1]["reference"] is None
+
+
+class TestPrependReasoningBlock:
+    """Reasoning prepend must hoist leading mentions so split re-injection works."""
+
+    def test_leading_mention_hoisted_above_reasoning(self):
+        from gateway.run import _prepend_reasoning_block
+        out = _prepend_reasoning_block("<@123> done, merged.", "thought about it")
+        assert out.startswith("<@123>\n💭 **Reasoning:**")
+        assert "done, merged." in out
+
+    def test_multiple_leading_mentions_hoisted(self):
+        from gateway.run import _prepend_reasoning_block
+        out = _prepend_reasoning_block("<@123> <@!456> report", "hmm")
+        assert out.startswith("<@123> <@!456>\n💭 **Reasoning:**")
+
+    def test_no_mention_keeps_reasoning_first(self):
+        from gateway.run import _prepend_reasoning_block
+        out = _prepend_reasoning_block("plain response", "hmm")
+        assert out.startswith("💭 **Reasoning:**")
+        assert out.endswith("plain response")
+
+    def test_mid_message_mention_not_hoisted(self):
+        from gateway.run import _prepend_reasoning_block
+        out = _prepend_reasoning_block("see <@123> later", "hmm")
+        assert out.startswith("💭 **Reasoning:**")
+
+    def test_hoisted_output_split_reinjects_mentions(self):
+        """End-to-end with the adapter's splitter: every chunk pings."""
+        from gateway.run import _prepend_reasoning_block
+        from gateway.platforms.discord import _leading_mentions
+        out = _prepend_reasoning_block("<@123> " + "x" * 4000, "reasoning text")
+        assert _leading_mentions(out) == "<@123>"
