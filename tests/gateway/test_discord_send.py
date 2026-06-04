@@ -153,3 +153,60 @@ class TestPrependReasoningBlock:
         from gateway.platforms.discord import _leading_mentions
         out = _prepend_reasoning_block("<@123> " + "x" * 4000, "reasoning text")
         assert _leading_mentions(out) == "<@123>"
+
+
+class TestMidTextMentionSplit:
+    """Mention-less chunks of a split message get the message's first mention.
+
+    Repro: Kit's 8-part sectioned review (2026-06-04) led with prose, carried
+    mentions per-section; section boundaries didn't align with chunk boundaries
+    so parts 5 and 8 went out mention-less and Ziggy's monitor missed them.
+    """
+
+    def _adapter(self):
+        from gateway.platforms.discord import DiscordAdapter
+        return DiscordAdapter.__new__(DiscordAdapter)
+
+    def test_mid_text_mention_becomes_fallback_prefix(self):
+        from gateway.platforms.discord import _leading_mentions
+        import re
+        # Message starts with prose, mention appears mid-text
+        formatted = "79 commits, analysis below.\n\n<@111> section one\n" + "x" * 4500
+        assert _leading_mentions(formatted) == ""  # leading detection misses it
+        first = re.search(r"<@!?\d+>", formatted)
+        assert first.group(0) == "<@111>"
+
+    def test_every_chunk_carries_target_mention(self):
+        """Simulate the send-path chunk logic on a sectioned multi-part message."""
+        import re
+        from gateway.platforms.discord import DiscordAdapter, _leading_mentions
+
+        adapter = self._adapter()
+        formatted = (
+            "prose intro with no mention\n\n"
+            + "<@111> **section A**\n" + "a" * 1900
+            + "\n\nmention-less middle section\n" + "b" * 1900
+            + "\n\n<@111> **section B**\n" + "c" * 1900
+        )
+        mention_prefix = _leading_mentions(formatted)
+        if not mention_prefix:
+            m = re.search(r"<@!?\d+>", formatted)
+            mention_prefix = m.group(0) if m else ""
+        split_limit = adapter.MAX_MESSAGE_LENGTH - (len(mention_prefix) + 1)
+        chunks = adapter.truncate_message(formatted, split_limit)
+        assert len(chunks) > 2
+        if mention_prefix and len(chunks) > 1:
+            chunks = [
+                c if mention_prefix in c else f"{mention_prefix}\n{c}"
+                for c in chunks
+            ]
+        for i, chunk in enumerate(chunks):
+            assert mention_prefix in chunk, f"chunk {i} lost the mention"
+
+    def test_other_users_mention_does_not_satisfy_target(self):
+        """A chunk containing only a different user's mention still gets the prefix."""
+        target = "<@111>"
+        chunk_with_other = "see <@222> for details"
+        result = chunk_with_other if target in chunk_with_other else f"{target}\n{chunk_with_other}"
+        assert result.startswith("<@111>")
+        assert "<@222>" in result

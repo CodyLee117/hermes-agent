@@ -810,15 +810,29 @@ class DiscordAdapter(BasePlatformAdapter):
             # stay under MAX_MESSAGE_LENGTH.
             formatted = self.format_message(content)
             mention_prefix = _leading_mentions(formatted)
+            # Fallback: a coordination message may carry its mention(s) mid-text
+            # rather than leading (e.g. sectioned reviews).  Section boundaries
+            # don't align with chunk boundaries, so chunks between mentions go
+            # out mention-less and the recipient's monitor misses them.  Use the
+            # first mention found anywhere as the re-injection prefix.
+            if not mention_prefix:
+                _first = re.search(r"<@!?\d+>", formatted)
+                if _first:
+                    mention_prefix = _first.group(0)
             split_limit = self.MAX_MESSAGE_LENGTH
             if mention_prefix:
                 split_limit -= len(mention_prefix) + 1  # +1 for the rejoining newline
             chunks = self.truncate_message(formatted, split_limit)
-            # Re-inject the mention(s) into continuation chunks so every part pings
-            # the target — chunk 0 already carries them as the message's start.
-            # Without this, a split message only wakes the recipient on chunk 0.
+            # Re-inject the mention(s) into every chunk that doesn't already
+            # carry them, so every part pings the target.  Without this, a
+            # split message only wakes the recipient on the parts that happen
+            # to contain the mention.  Containing some *other* user's mention
+            # doesn't count — the coordination target's monitor needs its own.
             if mention_prefix and len(chunks) > 1:
-                chunks = [chunks[0]] + [f"{mention_prefix}\n{c}" for c in chunks[1:]]
+                chunks = [
+                    c if mention_prefix in c else f"{mention_prefix}\n{c}"
+                    for c in chunks
+                ]
 
             message_ids = []
             reference = None
