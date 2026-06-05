@@ -693,6 +693,18 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except asyncio.TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            # Tear down the half-open client. Without this, the background
+            # _bot_task keeps connecting on its own — the bot shows ONLINE in
+            # Discord while the gateway routes nothing (2026-06-05 Scout
+            # incident), and the lingering session can starve the next IDENTIFY.
+            try:
+                if self._bot_task is not None:
+                    self._bot_task.cancel()
+                    self._bot_task = None
+                if self._client is not None and not self._client.is_closed():
+                    await self._client.close()
+            except Exception:
+                pass
             try:
                 from gateway.status import release_scoped_lock
                 if getattr(self, '_token_lock_identity', None):
@@ -700,6 +712,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._token_lock_identity = None
             except Exception:
                 pass
+            # Mark retryable so run.py queues this platform for reconnection —
+            # a bare False (no fatal error) is dropped from the retry queue and
+            # the platform stays dead until a manual restart.
+            self._set_fatal_error(
+                'discord_connect_timeout',
+                'Timeout waiting for Discord READY (queued for retry)',
+                retryable=True)
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
