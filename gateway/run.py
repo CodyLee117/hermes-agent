@@ -966,6 +966,38 @@ class GatewayRunner:
         return result
 
     @staticmethod
+    def _load_max_tokens() -> int | None:
+        """Load agent.max_tokens from config.yaml with env fallback.
+
+        Thinking models (e.g. MiniMax M3) spend reasoning tokens INSIDE the
+        output budget — with the provider's default cap, a long reasoning
+        pass can exhaust generation before the model emits its tool call or
+        final answer (the run dies mid-thought with the work undone). Set
+        agent.max_tokens generously for such models. None = provider default.
+        Env fallback: HERMES_MAX_TOKENS.
+        """
+        raw = ""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                raw = str(cfg.get("agent", {}).get("max_tokens", "") or "").strip()
+        except Exception:
+            pass
+        if not raw:
+            raw = os.getenv("HERMES_MAX_TOKENS", "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+            return value if value > 0 else None
+        except ValueError:
+            logger.warning("Invalid agent.max_tokens '%s', using provider default", raw)
+            return None
+
+    @staticmethod
     def _load_show_reasoning() -> bool:
         """Load show_reasoning toggle from config.yaml display section."""
         try:
@@ -4441,6 +4473,7 @@ class GatewayRunner:
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
+            max_tokens = self._load_max_tokens()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             def run_sync():
@@ -4448,6 +4481,7 @@ class GatewayRunner:
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
+                    max_tokens=max_tokens,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
