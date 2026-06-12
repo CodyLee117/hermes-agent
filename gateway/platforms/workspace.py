@@ -189,6 +189,19 @@ class WorkspaceAdapter(BasePlatformAdapter):
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
 
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """OMNI-060: ephemeral typing signal — Hermes fires this during turn
+        processing, so the workspace shows a thinking indicator. Best-effort."""
+        if not self._http:
+            return
+        try:
+            await self._http.post(
+                f"{self.base_url}/api/chat/channels/{chat_id}/typing",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+        except Exception:
+            pass
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chan = self._channels.get(str(chat_id), {})
         return {
