@@ -6204,9 +6204,13 @@ class GatewayRunner:
             or "all"
         )
         # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # so each progress line would be sent as a separate message. Same for
+        # workspace chat, where it's worse: the store is append-only, so every
+        # progress line becomes a PERMANENT message row (OMNI-061 item 6 —
+        # Kit's first review turn wrote 14 tool-status rows into #commons).
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (progress_mode != "off"
+                                 and source.platform not in (Platform.WEBHOOK, Platform.WORKSPACE))
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
