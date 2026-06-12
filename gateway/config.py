@@ -910,6 +910,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.WORKSPACE] = PlatformConfig()
         config.platforms[Platform.WORKSPACE].enabled = True
         config.platforms[Platform.WORKSPACE].token = workspace_token
+        workspace_home = os.getenv("WORKSPACE_HOME_CHANNEL")
+        if workspace_home:
+            config.platforms[Platform.WORKSPACE].home_channel = HomeChannel(
+                platform=Platform.WORKSPACE,
+                chat_id=workspace_home,
+                name=os.getenv("WORKSPACE_HOME_CHANNEL_NAME", "workspace-dm"),
+            )
 
     # WeCom (Enterprise WeChat)
     wecom_bot_id = os.getenv("WECOM_BOT_ID")
