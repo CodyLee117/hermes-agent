@@ -63,6 +63,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    WORKSPACE = "workspace"
 
 
 @dataclass
@@ -901,6 +902,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=feishu_home,
                 name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
             )
+
+    # Workspace chat (Omnipotence portal, OMNI-058b)
+    workspace_token = os.getenv("WORKSPACE_CHAT_TOKEN")
+    if workspace_token and os.getenv("WORKSPACE_CHAT_URL") and os.getenv("WORKSPACE_CHAT_AGENT"):
+        if Platform.WORKSPACE not in config.platforms:
+            config.platforms[Platform.WORKSPACE] = PlatformConfig()
+        config.platforms[Platform.WORKSPACE].enabled = True
+        config.platforms[Platform.WORKSPACE].token = workspace_token
 
     # WeCom (Enterprise WeChat)
     wecom_bot_id = os.getenv("WECOM_BOT_ID")
