@@ -36,10 +36,19 @@ import json
 import logging
 import os
 import re
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# OMNI-079b: the operating-procedures loader. Fetch this agent's resolved
+# rules-as-data from the portal and inject them, generalizing the project-doc
+# injection above. Cached briefly so per-message injection isn't an HTTP call.
+_proc_cache: Dict[tuple, Tuple[float, str]] = {}
+_PROC_TTL = 60.0
 
 # Safety cap per project doc so a runaway rules file can't blow up the prompt.
 _MAX_DOC_CHARS = 32_768
@@ -129,6 +138,44 @@ def _load_project_doc(project: str) -> Optional[str]:
     return None
 
 
+def _load_procedures_block(projects: List[str]) -> str:
+    """OMNI-079b: the agent's resolved operating procedures (global + type +
+    project + agent), fetched from the portal. Best-effort, cached, fail-open —
+    a portal hiccup must never block message handling. Loads even with no
+    project mapped (global rules always apply)."""
+    base = (os.getenv("WORKSPACE_CHAT_URL") or "").rstrip("/")
+    token = os.getenv("WORKSPACE_CHAT_TOKEN") or ""
+    agent = os.getenv("WORKSPACE_CHAT_AGENT") or ""
+    if not (base and token and agent):
+        return ""
+    project = projects[0] if projects else None
+    key = (agent, project)
+    now = time.time()
+    hit = _proc_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    params = {"agent": agent, "type": "hermes"}
+    if project:
+        params["project"] = project
+    url = f"{base}/api/workspace/procedures/resolved?{urllib.parse.urlencode(params)}"
+    block = ""
+    try:
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {token}",
+                          "User-Agent": "hermes-procedures/0.1"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            procs = json.loads(r.read() or b"{}").get("procedures", [])
+        if procs:
+            items = "\n\n".join(f"**{p['title']}**\n{p['body']}" for p in procs)
+            block = ("## Operating Procedures (auto-loaded)\n\n"
+                     "Follow these rules for the duration of this session.\n\n" + items)
+    except Exception as exc:  # fail-open
+        logger.debug("procedures injection failed (non-fatal): %s", exc)
+        return ""  # don't cache a transient failure
+    _proc_cache[key] = (now + _PROC_TTL, block)
+    return block
+
+
 def get_project_context_block(source, session_id: str) -> str:
     """Build the project-context block for this message ("" when nothing maps).
 
@@ -137,9 +184,6 @@ def get_project_context_block(source, session_id: str) -> str:
     """
     try:
         channel_map = _load_channel_map()
-        if not channel_map and not _session_projects.get(str(session_id)):
-            return ""
-
         if len(_session_projects) > _MAX_TRACKED_SESSIONS:
             _session_projects.clear()
         loaded = _session_projects.setdefault(str(session_id), [])
@@ -154,23 +198,27 @@ def get_project_context_block(source, session_id: str) -> str:
                     project, session_id, cid,
                 )
 
-        if not loaded:
-            return ""
-
+        blocks = []
         sections = []
         for project in loaded:
             doc = _load_project_doc(project)
             if doc and doc.strip():
                 sections.append(f"### Project: {project}\n\n{doc.strip()}")
-        if not sections:
-            return ""
+        if sections:
+            blocks.append(
+                "## Project Context (auto-loaded)\n\n"
+                "This channel maps to the project(s) below. Follow their rules and "
+                "workflow for the duration of this session.\n\n"
+                + "\n\n---\n\n".join(sections)
+            )
 
-        return (
-            "## Project Context (auto-loaded)\n\n"
-            "This channel maps to the project(s) below. Follow their rules and "
-            "workflow for the duration of this session.\n\n"
-            + "\n\n---\n\n".join(sections)
-        )
+        # OMNI-079b: operating procedures load regardless of project mapping
+        # (global rules always apply); project-scoped ones use the loaded project.
+        proc_block = _load_procedures_block(loaded)
+        if proc_block:
+            blocks.append(proc_block)
+
+        return "\n\n---\n\n".join(blocks)
     except Exception as exc:  # fail-open: never block message handling
         logger.warning("project-context injection failed (non-fatal): %s", exc)
         return ""
@@ -180,3 +228,4 @@ def _reset_state_for_tests() -> None:
     """Clear module caches/state (test helper)."""
     _file_cache.clear()
     _session_projects.clear()
+    _proc_cache.clear()

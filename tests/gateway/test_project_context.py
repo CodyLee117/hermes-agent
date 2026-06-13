@@ -124,3 +124,69 @@ class TestGetProjectContextBlock:
         class Broken:
             pass
         assert get_project_context_block(Broken(), "sess-1") == ""
+
+
+class TestProceduresLoader:
+    """OMNI-079b: operating-procedures injection from the portal."""
+
+    def _set_env(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_CHAT_URL", "http://portal")
+        monkeypatch.setenv("WORKSPACE_CHAT_TOKEN", "kit-tok")
+        monkeypatch.setenv("WORKSPACE_CHAT_AGENT", "kit")
+
+    def _mock_urlopen(self, monkeypatch, procedures):
+        import io
+        from gateway import project_context as pc
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"procedures": procedures}).encode()
+
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["auth"] = req.headers.get("Authorization")
+            return _Resp()
+
+        monkeypatch.setattr(pc.urllib.request, "urlopen", fake_urlopen)
+        return captured
+
+    def test_no_env_no_block(self, hermes_home, monkeypatch):
+        from gateway.project_context import _load_procedures_block
+        # no WORKSPACE_CHAT_* env -> ""
+        monkeypatch.delenv("WORKSPACE_CHAT_URL", raising=False)
+        assert _load_procedures_block([]) == ""
+
+    def test_loads_and_formats(self, hermes_home, monkeypatch):
+        from gateway.project_context import _load_procedures_block
+        self._set_env(monkeypatch)
+        cap = self._mock_urlopen(monkeypatch, [
+            {"title": "English only", "body": "Respond in English."},
+            {"title": "No filler", "body": "No ack-only replies."},
+        ])
+        block = _load_procedures_block(["galactic-cruise"])
+        assert "## Operating Procedures (auto-loaded)" in block
+        assert "**English only**" in block and "Respond in English." in block
+        assert "agent=kit" in cap["url"] and "type=hermes" in cap["url"]
+        assert "project=galactic-cruise" in cap["url"]
+        assert cap["auth"] == "Bearer kit-tok"
+
+    def test_injected_even_without_project(self, hermes_home, monkeypatch):
+        # an unmapped channel still loads global procedures
+        self._set_env(monkeypatch)
+        self._mock_urlopen(monkeypatch, [{"title": "Global rule", "body": "do X"}])
+        block = get_project_context_block(_source("999"), "sess-proc")
+        assert "## Operating Procedures (auto-loaded)" in block
+        assert "**Global rule**" in block
+
+    def test_fail_open_on_http_error(self, hermes_home, monkeypatch):
+        from gateway import project_context as pc
+        from gateway.project_context import _load_procedures_block
+        self._set_env(monkeypatch)
+
+        def boom(req, timeout=None):
+            raise RuntimeError("portal down")
+        monkeypatch.setattr(pc.urllib.request, "urlopen", boom)
+        assert _load_procedures_block([]) == ""  # never raises
