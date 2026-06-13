@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from gateway.run import _collect_reasoning
+from gateway.run import _collect_reasoning, _tool_call_arg_hint
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.workspace import WorkspaceAdapter
 
@@ -29,6 +29,50 @@ def test_collect_reasoning_concatenates_all_steps():
     out = _collect_reasoning(result)
     assert "step one thinking" in out and "step two thinking" in out
     assert out.index("step one") < out.index("step two")  # in order
+
+
+def test_collect_reasoning_interleaves_tool_calls():
+    result = {
+        "messages": [
+            {"role": "assistant", "reasoning": "let me look",
+             "tool_calls": [{"function": {"name": "read_file",
+                                          "arguments": '{"file_path": "/a/b.py"}'}}]},
+            {"role": "tool", "content": "..."},
+            {"role": "assistant", "reasoning": "now I know", "content": "done"},
+        ],
+    }
+    out = _collect_reasoning(result)
+    # reasoning AND the tool call appear, in chronological order
+    assert "let me look" in out
+    assert "🔧 `read_file`" in out and "file_path=/a/b.py" in out
+    assert "now I know" in out
+    assert out.index("let me look") < out.index("read_file") < out.index("now I know")
+
+
+def test_collect_reasoning_scopes_to_current_turn():
+    # messages carries the whole session; history_offset marks where THIS turn
+    # begins. Prior turns must NOT appear in the trace.
+    result = {
+        "messages": [
+            {"role": "user", "content": "old q"},
+            {"role": "assistant", "reasoning": "PRIOR TURN thinking",
+             "tool_calls": [{"function": {"name": "old_tool", "arguments": "{}"}}]},
+            {"role": "user", "content": "new q"},
+            {"role": "assistant", "reasoning": "THIS TURN thinking", "content": "done"},
+        ],
+        "history_offset": 3,
+    }
+    out = _collect_reasoning(result)
+    assert "THIS TURN thinking" in out
+    assert "PRIOR TURN" not in out and "old_tool" not in out
+
+
+def test_tool_call_arg_hint_prefers_recognizable_field():
+    assert _tool_call_arg_hint('{"command": "ls -la", "x": 1}') == "command=ls -la"
+    assert _tool_call_arg_hint({"file_path": "/x/y"}) == "file_path=/x/y"
+    assert _tool_call_arg_hint("not json") == "not json"
+    assert _tool_call_arg_hint("{}") == ""
+    assert _tool_call_arg_hint({"weird": "v"}) == "weird=v"
 
 
 def test_collect_reasoning_falls_back_to_last():

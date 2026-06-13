@@ -255,22 +255,55 @@ def _prepend_reasoning_block(response: str, display_reasoning: str) -> str:
     return block + response
 
 
-def _collect_reasoning(agent_result: dict) -> str:
-    """OMNI-068 slice 3: the FULL turn's reasoning for the workspace 💭 panel.
+def _tool_call_arg_hint(arguments) -> str:
+    """A short, safe one-liner summarizing a tool call's args for the trace.
+    Prefers a human-recognizable field (path/command/query/…), truncates hard."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            return arguments.strip()[:80]
+    if not isinstance(arguments, dict) or not arguments:
+        return ""
+    for key in ("file_path", "path", "command", "cmd", "query", "url", "pattern", "name"):
+        if key in arguments and isinstance(arguments[key], (str, int, float)):
+            return f"{key}={str(arguments[key])[:80]}"
+    k = next(iter(arguments))
+    return f"{k}={str(arguments[k])[:60]}"
 
-    Concatenates every assistant step's thinking in order — `last_reasoning`
-    only carries the LAST assistant message's reasoning, but a multi-step agent
-    loop reasons at each tool-calling step. Falls back to `last_reasoning` if the
-    messages list doesn't carry per-message reasoning.
+
+def _collect_reasoning(agent_result: dict) -> str:
+    """OMNI-068 slices 3/4: the FULL turn's reasoning + tool-call trace for the
+    workspace 💭 panel.
+
+    Walks every step in order and interleaves each assistant step's thinking
+    with the tool calls it made (think → 🔧 call → think → …), so the panel
+    shows the agent's actual work, not just the last thought. `last_reasoning`
+    only carries the LAST assistant message's reasoning — this captures all
+    steps. Falls back to `last_reasoning` if messages aren't available.
+
+    Scoped to THIS turn via `history_offset` — `messages` carries the whole
+    session, so without the slice the trace would replay every prior turn's
+    reasoning and tool calls.
     """
+    msgs = agent_result.get("messages", []) or []
+    offset = agent_result.get("history_offset", 0)
+    if isinstance(offset, int) and 0 <= offset <= len(msgs):
+        msgs = msgs[offset:]
     parts = []
-    for msg in agent_result.get("messages", []) or []:
-        if msg.get("role") == "assistant":
-            r = msg.get("reasoning")
-            if r and r.strip():
-                parts.append(r.strip())
+    for msg in msgs:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        r = msg.get("reasoning")
+        if r and r.strip():
+            parts.append(r.strip())
+        for tc in (msg.get("tool_calls") or []):
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            name = fn.get("name") or (tc.get("name") if isinstance(tc, dict) else "") or "tool"
+            hint = _tool_call_arg_hint(fn.get("arguments"))
+            parts.append(f"🔧 `{name}`" + (f" — {hint}" if hint else ""))
     if parts:
-        return "\n\n---\n\n".join(parts)
+        return "\n\n".join(parts)
     last = agent_result.get("last_reasoning")
     return last.strip() if last and last.strip() else ""
 
