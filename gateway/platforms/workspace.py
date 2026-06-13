@@ -66,7 +66,18 @@ class WorkspaceAdapter(BasePlatformAdapter):
         self._channels: Dict[str, dict] = {}  # chat_id -> channel meta (from hello)
         self._listen_task: Optional[asyncio.Task] = None
         self._http = None  # aiohttp.ClientSession, created on connect
-        self._mention_re = re.compile(rf"\b{re.escape(self.agent)}\b", re.IGNORECASE) if self.agent else None
+        # OMNI-063: direct-address only — the agent's name at the start of the
+        # message or a line, NOT anywhere in prose. Talking ABOUT an agent
+        # ("scout, forge, ignore this") must not dispatch them (the 2026-06-13
+        # name-cascade that drained the shared Ollama pool).
+        self._mention_re = (
+            re.compile(rf"(?im)^\s*@?{re.escape(self.agent)}\b") if self.agent else None
+        )
+        # OMNI-068 slice 3: the gateway stashes this turn's full reasoning here
+        # (keyed by chat_id) before the reply is sent; send() POSTs it to the
+        # Cody-only 💭 panel once it has the reply's message_id. Per-agent
+        # reasoning_disabled toggle is enforced server-side.
+        self._pending_reasoning: Dict[str, str] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -148,8 +159,13 @@ class WorkspaceAdapter(BasePlatformAdapter):
             return  # second self-echo rail; server already excludes own messages
         chan = self._channels.get(chat_id, {})
         is_dm = chan.get("kind") == "dm"
-        if not is_dm and self._mention_re and not self._mention_re.search(body):
-            return  # requireMention posture in shared channels — loop safety
+        # OMNI-063: the portal hands each channel this agent's dispatch mode.
+        # Absent (older portal) -> "mention" preserves prior behavior.
+        mode = chan.get("dispatch", "all" if is_dm else "mention")
+        if mode == "off":
+            return
+        if mode == "mention" and self._mention_re and not self._mention_re.search(body):
+            return  # direct-address required in this channel — loop + cost safety
         source = self.build_source(
             chat_id=chat_id,
             chat_name=f"#{chan.get('name', chat_id)}",
@@ -167,6 +183,34 @@ class WorkspaceAdapter(BasePlatformAdapter):
 
     # ── outbound ─────────────────────────────────────────────────────────────
 
+    def stash_reasoning(self, chat_id: str, text: str) -> None:
+        """OMNI-068 slice 3: the gateway hands us this turn's reasoning before
+        the reply is sent; send() flushes it once it knows the reply's id."""
+        if text:
+            self._pending_reasoning[str(chat_id)] = text
+
+    async def _flush_reasoning(self, chat_id: str, message_id: str) -> None:
+        """POST stashed reasoning to the Cody-only 💭 panel. Best-effort — a
+        failure here must never affect message delivery. The server enforces
+        machine-only auth + the per-agent reasoning_disabled toggle."""
+        text = self._pending_reasoning.pop(str(chat_id), None)
+        if not text or not message_id:
+            return
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return
+        try:
+            async with self._http.post(
+                f"{self.base_url}/api/chat/reasoning",
+                headers={"Authorization": f"Bearer {self.token}"},
+                json={"message_id": mid, "text": text},
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("workspace: reasoning POST -> HTTP %s", resp.status)
+        except Exception as exc:
+            logger.debug("workspace: reasoning POST failed: %s", exc)
+
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -180,8 +224,11 @@ class WorkspaceAdapter(BasePlatformAdapter):
             ) as resp:
                 payload = await resp.json(content_type=None)
                 if resp.status == 200:
+                    mid = str(payload.get("message", {}).get("id", ""))
+                    # OMNI-068 slice 3: attach this turn's reasoning to the reply
+                    await self._flush_reasoning(chat_id, mid)
                     return SendResult(success=True,
-                                      message_id=str(payload.get("message", {}).get("id", "")),
+                                      message_id=mid,
                                       raw_response=payload)
                 detail = payload.get("detail", f"HTTP {resp.status}")
                 return SendResult(success=False, error=str(detail),

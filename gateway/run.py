@@ -255,6 +255,26 @@ def _prepend_reasoning_block(response: str, display_reasoning: str) -> str:
     return block + response
 
 
+def _collect_reasoning(agent_result: dict) -> str:
+    """OMNI-068 slice 3: the FULL turn's reasoning for the workspace 💭 panel.
+
+    Concatenates every assistant step's thinking in order — `last_reasoning`
+    only carries the LAST assistant message's reasoning, but a multi-step agent
+    loop reasons at each tool-calling step. Falls back to `last_reasoning` if the
+    messages list doesn't carry per-message reasoning.
+    """
+    parts = []
+    for msg in agent_result.get("messages", []) or []:
+        if msg.get("role") == "assistant":
+            r = msg.get("reasoning")
+            if r and r.strip():
+                parts.append(r.strip())
+    if parts:
+        return "\n\n---\n\n".join(parts)
+    last = agent_result.get("last_reasoning")
+    return last.strip() if last and last.strip() else ""
+
+
 def _normalize_whatsapp_identifier(value: str) -> str:
     """Strip WhatsApp JID/LID syntax down to its stable numeric identifier."""
     return (
@@ -3018,8 +3038,19 @@ class GatewayRunner:
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
 
-            # Prepend reasoning/thinking if display is enabled
-            if getattr(self, "_show_reasoning", False) and response:
+            # OMNI-068 slice 3: on the workspace platform, reasoning goes to the
+            # Cody-only 💭 side panel — NOT prepended to the message body. The
+            # adapter POSTs it after sending (it owns the reply's message_id);
+            # the server honors the per-agent reasoning_disabled toggle. Discord
+            # keeps the existing in-body block below.
+            if source.platform == Platform.WORKSPACE:
+                _wreason = _collect_reasoning(agent_result)
+                if _wreason:
+                    _wadapter = self.adapters.get(source.platform)
+                    if _wadapter is not None and hasattr(_wadapter, "stash_reasoning"):
+                        _wadapter.stash_reasoning(source.chat_id, _wreason)
+            # Prepend reasoning/thinking if display is enabled (non-workspace)
+            elif getattr(self, "_show_reasoning", False) and response:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -6441,6 +6472,11 @@ class GatewayRunner:
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
+                return
+            # Workspace chat is append-only: lifecycle/retry status lines
+            # become PERMANENT message rows (the 2026-06-13 429-retry spam,
+            # #omni msgs 136-172). Same exclusion as tool progress + webhooks.
+            if source.platform == Platform.WORKSPACE:
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
