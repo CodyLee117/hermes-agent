@@ -166,6 +166,109 @@ def detect_dangerous_command(command: str) -> tuple:
 
 
 # =========================================================================
+# Peer-restart guard (OMNI-200 S2 / DDR-0036 P-6)
+# =========================================================================
+# Every crew agent runs as a systemd *user* service (`hermes-<profile>.service`)
+# under the SAME OS user, so any agent can restart/stop/kill a PEER's gateway or
+# process — the 2026-06-29 cascade where a confused agent `systemctl stop`+`pkill
+# -9`'d its peers (incl. the dispatcher). SOUL.md text and the approval prompt do
+# NOT hold here: the crew run `approvals.mode: off`, which short-circuits every
+# guard. So this is a HARD, UNBYPASSABLE block that check_all_command_guards runs
+# BEFORE the yolo/off bypass. An agent may bounce its OWN service; never a peer's.
+
+# Agent roster → the names that appear in `hermes-<name>.service`, `<name>-gateway`
+# service stems, and process tokens. ziggy is the dispatcher/coordinator; cortana
+# is a sibling assistant — both are off-limits to the crew (memory: "crew must
+# never restart peers or Ziggy"). Derived from the live unit naming convention.
+_AGENT_ROSTER = ("kit", "forge", "scout", "pixel", "pipe", "ziggy", "cortana")
+
+# State-changing systemctl verbs (read-only `status`/`show`/`cat` + journalctl are
+# intentionally NOT here — inspecting a peer's logs is fine; bouncing it is not).
+_SYSTEMCTL_LIFECYCLE = (
+    r"(?:restart|stop|start|kill|disable|mask|reload|try-restart|"
+    r"reload-or-restart|force-reload)"
+)
+
+
+def _own_agent_identity() -> str:
+    """The running agent's own name, lowercased — used to allow self-service ops
+    while blocking peers. Prefers the explicit workspace-chat identity, falls back
+    to the active Hermes profile. Empty string when indeterminate → the guard
+    fails CLOSED (treats every agent service as a peer)."""
+    name = (os.getenv("WORKSPACE_CHAT_AGENT") or "").strip().lower()
+    if name:
+        return name
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        p = (get_active_profile_name() or "").strip().lower()
+        if p and p not in ("default", "custom"):
+            return p
+    except Exception:
+        pass
+    return ""
+
+
+def _peer_service_tokens(command_norm: str, own: str) -> list[str]:
+    """Agent-service/process tokens in `command_norm` that belong to a PEER (≠ own).
+    Matches `hermes-<name>`, `<name>-gateway`, and the bare `ziggy-chat-leg` unit."""
+    hits: list[str] = []
+    for m in re.finditer(r"\bhermes-([a-z0-9_]+)(?:\.service)?\b", command_norm):
+        if m.group(1) in _AGENT_ROSTER and m.group(1) != own:
+            hits.append(m.group(0))
+    for m in re.finditer(r"\b([a-z0-9_]+)-gateway(?:\.service)?\b", command_norm):
+        if m.group(1) in _AGENT_ROSTER and m.group(1) != own:
+            hits.append(m.group(0))
+    if "ziggy-chat-leg" in command_norm and own != "ziggy":
+        hits.append("ziggy-chat-leg")
+    return hits
+
+
+def check_peer_restart_guard(command: str) -> Optional[str]:
+    """Return a human-readable block reason if `command` would restart/stop/kill a
+    PEER agent's gateway service or process; None if allowed. By construction
+    (OMNI-200 S2 / DDR-0036 P-6): an agent never restarts/kills another agent — and
+    especially not the dispatcher (ziggy). It MAY bounce its own service.
+
+    Two vectors are blocked:
+      1. `systemctl [--user] <lifecycle> … hermes-<peer>` / `<peer>-gateway`.
+      2. `pkill`/`killall` of hermes/gateway/cli.py or any peer name — a broad
+         `pkill -f hermes` takes down everyone, so name-targeted process kills of
+         the agent fleet are refused outright (lifecycle is the monitor's job)."""
+    own = _own_agent_identity()
+    norm = _normalize_command_for_detection(command).lower()
+
+    # Vector 1 — systemctl lifecycle action on a peer agent service.
+    if re.search(rf"\bsystemctl\b.*\b{_SYSTEMCTL_LIFECYCLE}\b", norm):
+        peers = _peer_service_tokens(norm, own)
+        if peers:
+            return (
+                f"OMNI-200 peer-restart guard: refusing a systemctl lifecycle action on "
+                f"another agent's service ({', '.join(sorted(set(peers)))}). An agent never "
+                f"restarts/stops/kills a peer — especially the dispatcher. Bounce only your "
+                f"OWN service; escalate peer/dispatcher restarts to Cody."
+            )
+
+    # Vector 2 — pkill/killall of the agent fleet (hermes/gateway/cli.py or a peer name).
+    if re.search(r"\b(pkill|killall)\b", norm):
+        if re.search(r"\b(hermes|gateway|cli\.py)\b", norm):
+            return (
+                "OMNI-200 peer-restart guard: refusing pkill/killall of hermes/gateway "
+                "processes — a name-matched kill hits peers (incl. the dispatcher). Process "
+                "lifecycle is the monitor's job; use 'systemctl --user restart' on your OWN "
+                "service for recovery."
+            )
+        peers = [a for a in _AGENT_ROSTER if a != own
+                 and re.search(rf"\b{a}\b", norm)]
+        if peers:
+            return (
+                f"OMNI-200 peer-restart guard: refusing pkill/killall targeting a peer "
+                f"agent ({', '.join(sorted(set(peers)))}). An agent never kills a peer's "
+                f"processes; escalate to Cody."
+            )
+    return None
+
+
+# =========================================================================
 # Per-session approval state (thread-safe)
 # =========================================================================
 
@@ -651,9 +754,21 @@ def check_all_command_guards(command: str, env_type: str,
     a gateway force=True replay from bypassing one check when only the
     other was shown to the user.
     """
-    # Skip containers for both checks
+    # Skip containers for both checks (a container can't reach the host's systemd
+    # user units or the peer processes, so the peer-restart guard is moot there).
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
+
+    # OMNI-200 S2 (DDR-0036 P-6): the peer-restart guard is a HARD, UNBYPASSABLE
+    # block that runs BEFORE the yolo/off bypass below — the crew run
+    # `approvals.mode: off`, which short-circuits every other guard, so this is the
+    # only layer that actually holds under degradation. Gateway (autonomous) sessions
+    # only: an interactive human in CLI keeps the normal approval flow. Fails closed.
+    if os.getenv("HERMES_GATEWAY_SESSION"):
+        peer_block = check_peer_restart_guard(command)
+        if peer_block:
+            logger.warning("peer-restart guard BLOCKED: %s", command[:120])
+            return {"approved": False, "message": peer_block, "peer_restart_blocked": True}
 
     # --yolo or approvals.mode=off: bypass all approval prompts
     approval_mode = _get_approval_mode()
