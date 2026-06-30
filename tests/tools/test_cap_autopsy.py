@@ -126,6 +126,25 @@ def test_preserve_non_git_dir_returns_none(tmp_path):
     assert ca._preserve_work(str(tmp_path), "recovery/x") is None
 
 
+def test_api_sets_user_agent(monkeypatch):
+    """Regression (live e2e 2026-06-30): the portal WAF 403s urllib's default
+    'Python-urllib/x.y' UA, so _api MUST send an explicit User-Agent."""
+    import io
+    captured = {}
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["ua"] = req.get_header("User-agent")
+        return _Resp(b"{}")
+
+    monkeypatch.setattr(ca.urllib.request, "urlopen", fake_urlopen)
+    ca._api("GET", "https://p/x", "tok")
+    assert captured["ua"] and "urllib" not in captured["ua"].lower()
+
+
 # ── root gate on the agent hook (subagent must NOT autopsy parent's dispatch) ──
 
 from types import SimpleNamespace  # noqa: E402

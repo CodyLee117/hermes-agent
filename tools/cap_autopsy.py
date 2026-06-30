@@ -31,13 +31,17 @@ logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 10
 _GIT_TIMEOUT = 30
+# The portal sits behind a WAF that 403s urllib's default "Python-urllib/x.y"
+# User-Agent, so an explicit UA is REQUIRED (curl works because it sends its own).
+_USER_AGENT = "hermes-cap-autopsy/1.0 (OMNI-200)"
 
 
 def _api(method: str, url: str, token: str, body: dict | None = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         url, data=data, method=method,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                 "User-Agent": _USER_AGENT})
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
         return json.loads(r.read().decode() or "{}")
 
