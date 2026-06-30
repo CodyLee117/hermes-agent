@@ -6727,9 +6727,31 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in context pressure", exc_info=True)
 
+    def _file_cap_autopsy_if_root(self) -> None:
+        """OMNI-200 S2b (DDR-0036 P-6): on iteration-cap, the ROOT workspace agent files
+        an autopsy on its own stranded `working` dispatch(es) — so the task ends terminal
+        `dead` with a recovery pointer instead of waiting for the 3-day janitor. Subagents
+        skip (their cap is the parent turn's concern; firing here would wrongly autopsy the
+        parent's still-live dispatch). Best-effort + fire-and-forget; never raises into the
+        loop. Idempotent across turns: a dead dispatch no longer matches `state=working`."""
+        if getattr(self, "parent_session_id", None):
+            return  # subagent — not the dispatch owner's root turn
+        url = os.getenv("WORKSPACE_CHAT_URL")
+        agent = os.getenv("WORKSPACE_CHAT_AGENT")
+        token = os.getenv("WORKSPACE_CHAT_TOKEN")
+        if not (url and agent and token):
+            return  # not a workspace-chat gateway session — nothing to autopsy
+        try:
+            from tools.cap_autopsy import file_cap_autopsy
+            file_cap_autopsy(agent, url, token, os.getcwd())
+        except Exception as e:  # the fail-safe must never crash the agent
+            logger.warning("cap autopsy hook failed: %s", e)
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
+        # OMNI-200 S2b: preserve work + autopsy the stranded dispatch (root turn only).
+        self._file_cap_autopsy_if_root()
 
         summary_request = (
             "You've reached the maximum number of tool-calling iterations allowed. "
@@ -7205,6 +7227,8 @@ class AIAgent:
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+                # OMNI-200 S2b: preserve work + autopsy the stranded dispatch (root only).
+                self._file_cap_autopsy_if_root()
                 break
 
             # Fire step_callback for gateway hooks (agent:step event)
